@@ -41,13 +41,34 @@
 #define C_THUMB  RGB(90, 90, 90)
 
 /* ================================================================ platform */
-static char base[64];
+/* 保存場所は2種類: 内蔵メモリ = \\drv0\ 、SDカード = \\crd0\ 。
+ * それぞれの「ルート」と、アプリ用フォルダ(<ID>\_USER\ と <ID>\)の計6か所から *.IDX を探し、
+ * 見つかったものを「辞書」の一覧にする(同じ名前が内蔵とSDの両方にあれば別々に並ぶ)。 */
+#define MAX_ROOTS 6
+#define MAX_PACKS 24
+
+static char roots[MAX_ROOTS][40];
+static int root_media[MAX_ROOTS]; /* 0=内蔵 1=SD */
+static int nroots;
+
+struct packent {
+	uint8_t root;
+	char name[10];    /* 拡張子を除いたファイル名 */
+	char idxfile[16]; /* 見つかった WIKI.IDX の実際の綴り(大文字小文字を含む) */
+	uint8_t title[40];/* 表示名(NAME.NFO の1行目。無ければ name) Shift_JIS */
+};
+static struct packent packs[MAX_PACKS];
+static int npacks;
+
+static char cur_base[40];
+static char cur_name[10];
+static char cur_idx[16];
+static char font_path[64];
 static int fds[4][100];
 static int nopen;
-static int base_ok;
 
 /* ---- 診断用の記録(起動に失敗したとき画面に出す) ---- */
-#define DBG_N 12
+#define DBG_N 24
 static char dbg_path[DBG_N][48];
 static int dbg_fd[DBG_N];
 static int dbg_cnt;
@@ -68,12 +89,13 @@ static void dbg_rec(const char *path, int fd)
 }
 
 /* 開く。だめなら、ファイル名部分を小文字にしてもう一度試す(送信時に小文字化される場合に備える) */
-static int try_open(const char *path)
+static int try_open_q(const char *path, int rec)
 {
 	char low[96];
 	int fd, i, name = 0;
 	fd = sys_open(path, FILE_RD);
-	dbg_rec(path, fd);
+	if (rec)
+		dbg_rec(path, fd);
 	if (fd >= 0)
 		return fd;
 	for (i = 0; path[i] && i < 95; i++) {
@@ -88,20 +110,180 @@ static int try_open(const char *path)
 	if (strcmp(low, path) == 0)
 		return fd;
 	fd = sys_open(low, FILE_RD);
-	dbg_rec(low, fd);
+	if (rec)
+		dbg_rec(low, fd);
 	return fd;
 }
 
-static void make_name(char *dst, const char *b, int kind, int no)
+static int try_open(const char *path) { return try_open_q(path, 1); }
+
+static int ieq(const char *a, const char *b)
+{
+	while (*a && *b) {
+		char x = *a++, y = *b++;
+		if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
+		if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
+		if (x != y)
+			return 0;
+	}
+	return *a == *b;
+}
+
+static void reset_fds(void)
+{
+	int i, j;
+	for (i = 0; i < 4; i++)
+		for (j = 0; j < 100; j++)
+			fds[i][j] = -1;
+	nopen = 0;
+}
+
+static void init_roots(void)
+{
+	static const char *media[2] = {"\\\\drv0\\", "\\\\crd0\\"};
+	char id[16];
+	int m, k;
+	memset(id, 0, sizeof id);
+	sys_dict_info(&dbg_drv, id);
+	memcpy(dbg_id, id, sizeof id);
+	for (m = 0; m < 2; m++) {
+		for (k = 0; k < 3 && nroots < MAX_ROOTS; k++) {
+			strcpy(roots[nroots], media[m]);
+			if (k > 0) {
+				strcat(roots[nroots], id);
+				strcat(roots[nroots], k == 1 ? "\\_USER\\" : "\\");
+			}
+			root_media[nroots++] = m;
+		}
+	}
+	reset_fds();
+}
+
+/* sys_findfirst で mask(例 \\drv0\*.IDX)に合う名前を順に cb へ渡す。戻り値は件数 */
+static int each_file(const char *mask, void (*cb)(int, const char *), int arg)
+{
+	char fn[64];
+	int h = 0, ret, hits = 0;
+	unsigned long type = 0;
+	ret = sys_findfirst(mask, &h, fn, &type);
+	if (ret != 0)
+		return 0;
+	while (ret == 0) {
+		if (type == 1) {
+			cb(arg, fn);
+			hits++;
+		}
+		ret = sys_findnext(h, fn, &type);
+	}
+	sys_findclose(h);
+	return hits;
+}
+
+static void add_pack(int r, const char *fn)
+{
+	int n = (int)strlen(fn), i;
+	if (n < 5 || n > 12 || npacks >= MAX_PACKS || !ieq(fn + n - 4, ".IDX"))
+		return;
+	for (i = 0; i < npacks; i++)
+		if (packs[i].root == r && ieq(packs[i].idxfile, fn))
+			return;
+	packs[npacks].root = (uint8_t)r;
+	strcpy(packs[npacks].idxfile, fn);
+	memcpy(packs[npacks].name, fn, n - 4);
+	packs[npacks].name[n - 4] = 0;
+	packs[npacks].title[0] = 0;
+	npacks++;
+}
+
+/* 表示名: NAME.NFO の1行目(Shift_JIS)。無ければ NAME */
+static void load_title(struct packent *p)
+{
+	char path[64];
+	uint8_t buf[40];
+	int fd, n = 0, i = 0;
+	strcpy(path, roots[p->root]);
+	strcat(path, p->name);
+	strcat(path, ".NFO");
+	fd = try_open_q(path, 0);
+	if (fd >= 0) {
+		if (sys_seek(fd, 0, 0) >= 0)
+			n = sys_read(fd, buf, 36);
+		sys_close(fd);
+	}
+	if (n < 0)
+		n = 0;
+	for (i = 0; i < n && buf[i] != '\r' && buf[i] != '\n' && buf[i];) {
+		if (sjis_is_lead(buf[i])) {
+			if (i + 1 >= n || buf[i + 1] == '\r' || buf[i + 1] == '\n')
+				break;
+			i += 2;
+		} else {
+			i++;
+		}
+	}
+	if (i == 0) {
+		strcpy((char *)p->title, p->name);
+	} else {
+		memcpy(p->title, buf, i);
+		p->title[i] = 0;
+	}
+}
+
+static void scan_packs(void)
+{
+	static const char *masks[2] = {"*.IDX", "*.idx"};
+	char mask[64];
+	int r, k;
+	for (r = 0; r < nroots; r++) {
+		for (k = 0; k < 2; k++) {
+			strcpy(mask, roots[r]);
+			strcat(mask, masks[k]);
+			dbg_rec(mask, each_file(mask, add_pack, r));
+		}
+	}
+	for (r = 0; r < npacks; r++)
+		load_title(&packs[r]);
+}
+
+static int font_found;
+static void take_font(int r, const char *fn)
+{
+	if (!font_found) {
+		strcpy(font_path, roots[r]);
+		strcat(font_path, fn);
+		font_found = 1;
+	}
+}
+
+/* 日本語フォント(*.FNT)はどこの保存場所にあってもよい。最初に見つかったものを使う */
+static int find_font(void)
+{
+	static const char *masks[2] = {"*.FNT", "*.fnt"};
+	char mask[64];
+	int r, k;
+	for (r = 0; r < nroots && !font_found; r++) {
+		for (k = 0; k < 2 && !font_found; k++) {
+			strcpy(mask, roots[r]);
+			strcat(mask, masks[k]);
+			dbg_rec(mask, each_file(mask, take_font, r));
+		}
+	}
+	return font_found ? 0 : -1;
+}
+
+static void make_name(char *dst, int kind, int no)
 {
 	char t[4];
-	strcpy(dst, b);
+	if (kind == KIND_FNT) {
+		strcpy(dst, font_path);
+		return;
+	}
+	strcpy(dst, cur_base);
 	if (kind == KIND_IDX) {
-		strcat(dst, "WIKI.IDX");
-	} else if (kind == KIND_FNT) {
-		strcat(dst, "WIKI.FNT");
+		strcat(dst, cur_idx);
 	} else {
-		strcat(dst, "WIKI.");
+		strcat(dst, cur_name);
+		strcat(dst, ".");
 		t[0] = kind == KIND_DAT ? 'D' : 'I';
 		t[1] = '0' + (no / 10) % 10;
 		t[2] = '0' + no % 10;
@@ -110,63 +292,30 @@ static void make_name(char *dst, const char *b, int kind, int no)
 	}
 }
 
-/* libexword の send で送ったファイルはドライブのルート(\\drv0\ か \\crd0\)に置かれる。
- * 念のためアプリ用フォルダ(<APPID>\_USER\ と <APPID>\)も候補にし、
- * 最初に WIKI.IDX が開けた場所を以後ずっと使う。起動したメディアを先に試す。 */
-static int find_base(void)
+/* 辞書(パック)を切り替える。開いているファイルは閉じる */
+static void plat_select(int i)
 {
-	static const char *media[2] = {"\\\\drv0\\", "\\\\crd0\\"};
-	char id[16], path[96];
-	int m, s, fd;
-	memset(id, 0, sizeof id);
-	sys_dict_info(&dbg_drv, id);
-	memcpy(dbg_id, id, sizeof id);
-	for (m = 0; m < 2; m++) {
-		int mm = ((int)dbg_drv == 1) ? 1 - m : m;
-		for (s = 0; s < 3; s++) {
-			strcpy(base, media[mm]);
-			if (s > 0) {
-				strcat(base, id);
-				strcat(base, s == 1 ? "\\_USER\\" : "\\");
-			}
-			make_name(path, base, KIND_IDX, 0);
-			fd = try_open(path);
-			if (fd >= 0) {
-				sys_close(fd);
-				return 0;
-			}
-		}
-	}
-	return -1;
+	sys_closeall();
+	reset_fds();
+	strcpy(cur_base, roots[packs[i].root]);
+	strcpy(cur_name, packs[i].name);
+	strcpy(cur_idx, packs[i].idxfile);
 }
 
 int plat_read(int kind, int no, uint32_t off, void *buf, uint32_t len)
 {
 	int *slot;
 	uint32_t got = 0;
-	if (!base_ok) {
-		int i, j;
-		for (i = 0; i < 4; i++)
-			for (j = 0; j < 100; j++)
-				fds[i][j] = -1;
-		if (find_base() < 0)
-			return -1;
-		base_ok = 1;
-	}
 	if (no < 0 || no > 99)
 		return -1;
 	slot = &fds[kind][no];
 	if (*slot < 0) {
 		char path[96];
 		if (nopen >= 8) { /* 開きすぎないよう、一旦全部閉じる */
-			int i, j;
 			sys_closeall();
-			for (i = 0; i < 4; i++)
-				for (j = 0; j < 100; j++)
-					fds[i][j] = -1;
-			nopen = 0;
+			reset_fds();
 		}
-		make_name(path, base, kind, no);
+		make_name(path, kind, no);
 		*slot = try_open(path);
 		if (*slot < 0)
 			return -1;
@@ -281,8 +430,12 @@ static void draw_bar_bottom(const char *help)
 
 /* ================================================================== state */
 static struct pack pk;
-enum { M_SEARCH, M_ARTICLE };
+enum { M_PACKS, M_SEARCH, M_ARTICLE };
 static int mode = M_SEARCH;
+
+/* packs menu */
+static uint8_t pack_title[40];
+static int psel, ptop, pack_err;
 
 /* search */
 static char rom[48];
@@ -402,12 +555,63 @@ static void draw_article(void)
 	draw_bar_bottom(S_HELP_ART);
 }
 
+/* 辞書(パック)を開いて検索画面へ。失敗したら -1(理由は pack_err) */
+static int enter_pack(int i)
+{
+	int rc;
+	plat_select(i);
+	rc = pack_open(&pk);
+	if (rc != PACK_OK) {
+		pack_err = rc;
+		return -1;
+	}
+	memcpy(pack_title, packs[i].title, sizeof pack_title);
+	romlen = 0;
+	rom[0] = 0;
+	abc_mode = 0;
+	hist_n = 0;
+	img_w = img_h = 0;
+	pack_err = 0;
+	refresh_query();
+	mode = M_SEARCH;
+	return 0;
+}
+
+static void num(char *dst, int v);
+
+/* 辞書の選択画面。保存場所([内蔵] / [SD])ごとのタグを付けて並べる */
+static void draw_packs(void)
+{
+	int i, y;
+	fill_rect(0, 0, SW, SH, C_BG);
+	draw_bar_top((const uint8_t *)S_TITLE_PACKS);
+	for (i = 0; i < LIST_ROWS && ptop + i < npacks; i++) {
+		int idx = ptop + i, x;
+		const char *tag = root_media[packs[idx].root] ? S_TAG_SD : S_TAG_MEM;
+		uint16_t fg = (idx == psel) ? C_WHITE : C_FG;
+		y = BODY_Y + 6 + i * LH;
+		if (idx == psel)
+			fill_rect(X0 - 2, y - 1, SW - 2 * X0 + 4, LH, C_SEL);
+		x = draw_str(X0, y, tag, (idx == psel) ? C_WHITE : C_LINK, C_SEL, 0);
+		x = draw_sjis(x + 8, y, packs[idx].title, (int)strlen((char *)packs[idx].title), fg, C_SEL, 0);
+		draw_str(SW - 8 - 8 * (int)strlen(packs[idx].name), y, packs[idx].name,
+			 (idx == psel) ? C_WHITE : C_THUMB, C_SEL, 0);
+	}
+	if (pack_err) {
+		char n[12];
+		num(n, pack_err);
+		y = draw_str(X0, SH - BAR_H - 22, S_ERR_PACK_OPEN, C_HEAD, C_BG, 0);
+		draw_str(y, SH - BAR_H - 22, n, C_HEAD, C_BG, 0);
+	}
+	draw_bar_bottom(S_HELP_PACKS);
+}
+
 static void draw_search(void)
 {
 	uint32_t i, aid, idx;
 	int x, n = 0;
 	fill_rect(0, 0, SW, SH, C_BG);
-	draw_bar_top((const uint8_t *)S_TITLE_SEARCH);
+	draw_bar_top(pack_title);
 	x = draw_str(X0, 28, S_PROMPT, C_FG, C_BG, 0);
 	x = draw_sjis(x + 4, 28, qbuf, qlen, C_FG, C_BG, 0);
 	if (tail[0])
@@ -477,7 +681,7 @@ static int fatal(const char *what, int rc)
 	fill_rect(0, 0, SW, SH, C_BG);
 	set_pen(0x0000);
 	dbg_y = 6;
-	{ char t[32], n[12]; strcpy(t, "EXWIKI build "); num(n, 4); strcat(t, n); strcat(t, ": start failed"); dbg_line(t); }
+	{ char t[32], n[12]; strcpy(t, "EXWIKI build "); num(n, 5); strcat(t, n); strcat(t, ": start failed"); dbg_line(t); }
 	strcpy(b, "step: ");
 	strcat(b, what);
 	dbg_line(b);
@@ -518,7 +722,7 @@ static void show_loading(void)
 	lcdc_copy_vram();
 }
 
-#define BUILD_ID 4
+#define BUILD_ID 5
 
 /* 起動の進み具合を英数字で画面に出す(止まった場所が分かるように) */
 static void boot(const char *t, int v, int with_num)
@@ -556,6 +760,17 @@ static void show_link(void)
 		top = 0;
 }
 
+static void redraw(void)
+{
+	if (mode == M_PACKS)
+		draw_packs();
+	else if (mode == M_ARTICLE)
+		draw_article();
+	else
+		draw_search();
+	lcdc_copy_vram();
+}
+
 int main(void)
 {
 	int dirty = 1, i;
@@ -571,17 +786,25 @@ int main(void)
 	if (core_init() < 0 || !imgbuf)
 		return fatal("alloc (memmgr)", imgbuf ? 0 : -1);
 	boot("2 alloc ok", 0, 0);
+	init_roots();
+	if (find_font() < 0)
+		return fatal("no *.FNT font file", 0);
 	{
 		int rc = font_load();
 		boot("3 font bytes=", g_font_n, 1);
 		if (rc < 0)
-			return fatal("load WIKI.FNT", rc);
-		rc = pack_open(&pk);
-		if (rc != PACK_OK)
-			return fatal("open WIKI.IDX", rc);
-		boot("4 pack articles=", (int)pk.n_art, 1);
+			return fatal("load font", rc);
 	}
-	refresh_query();
+	scan_packs();
+	boot("4 dictionaries found=", npacks, 1);
+	if (npacks == 0)
+		return fatal("no *.IDX dictionary found", 0);
+	if (npacks == 1) {
+		if (enter_pack(0) != 0)
+			return fatal("open dictionary", pack_err);
+	} else {
+		mode = M_PACKS;
+	}
 
 	for (;;) {
 		uint32_t aid;
@@ -602,7 +825,26 @@ int main(void)
 		sym = get_key_pressed(KEY_SYMBOL);
 		f1 = get_key_pressed(KEY_FUNC_1);
 
-		if (mode == M_SEARCH) {
+		if (mode == M_PACKS) {
+			if (down && psel + 1 < npacks) {
+				psel++;
+				if (psel >= ptop + LIST_ROWS)
+					ptop++;
+				dirty = 1;
+			}
+			if (up && psel > 0) {
+				psel--;
+				if (psel < ptop)
+					ptop--;
+				dirty = 1;
+			}
+			if (enter) {
+				enter_pack(psel); /* 失敗したら pack_err を表示するだけで、選択画面に留まる */
+				dirty = 1;
+			}
+			if (back)
+				return -2;
+		} else if (mode == M_SEARCH) {
 			for (i = 0; i < 26; i++) {
 				if (get_key_pressed(LETTERS[i].code) && romlen < (int)sizeof rom - 1) {
 					rom[romlen++] = LETTERS[i].ch;
@@ -649,15 +891,13 @@ int main(void)
 					return fatal("open article", (int)cur_id);
 				}
 			}
-			if (back)
-				return -2;
-			if (dirty) {
-				if (mode == M_ARTICLE)
-					draw_article();
-				else
-					draw_search();
-				lcdc_copy_vram();
-				dirty = 0;
+			if (back) {
+				if (npacks > 1) {
+					mode = M_PACKS; /* 辞書が複数あるときは選択画面へ戻る */
+					dirty = 1;
+				} else {
+					return -2;
+				}
 			}
 		} else {
 			if (down && top < max_top()) { top++; dirty = 1; }
@@ -706,14 +946,10 @@ int main(void)
 				mode = M_SEARCH;
 				dirty = 1;
 			}
-			if (dirty) {
-				if (mode == M_ARTICLE)
-					draw_article();
-				else
-					draw_search();
-				lcdc_copy_vram();
-				dirty = 0;
-			}
+		}
+		if (dirty) {
+			redraw();
+			dirty = 0;
 		}
 	}
 }

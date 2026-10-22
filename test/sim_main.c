@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <sh4a/input/exword_keys.h>
 
-static const char *packdir, *outdir;
+static const char *packdir, *sddir, *outdir;
 static uint16_t vram[528 * 320];
 static int frame;
 
@@ -32,16 +32,35 @@ void render_text(uint16_t x, uint16_t y, char *t) { printf("TEXT(%d,%d): %s\n", 
 void memmgr_init(void) {}
 void *memmgr_alloc(unsigned long n) { return malloc(n); }
 
-/* ---- files: パスの末尾(WIKI.xxx)だけ見て packdir から開く ---- */
+/* ---- files: \\drv0\ は packdir(内蔵)、\\crd0\ は sddir(SD) に対応させる。
+ * アプリ用フォルダ(<ID>\\_USER\\ など)は空として扱う ---- */
+#include <dirent.h>
+#include <fnmatch.h>
 static FILE *files[64];
 void sys_dict_info(unsigned long *drv, char *id) { *drv = 0; strcpy(id, "XWIKI"); }
+
+/* "\\\\crd0\\foo" -> sd の foo, "\\\\drv0\\foo" -> 内蔵の foo。サブフォルダ付きは NULL */
+static int map_path(const char *p, char *out, size_t n)
+{
+	const char *dir = packdir;
+	const char *rest = p;
+	int slashes = 0;
+	const char *q;
+	if (!strncmp(p, "\\\\crd0\\", 7)) { dir = sddir; rest = p + 7; }
+	else if (!strncmp(p, "\\\\drv0\\", 7)) { rest = p + 7; }
+	if (!dir) return -1;
+	for (q = rest; *q; q++) if (*q == '\\') slashes++;
+	if (slashes) return -1;
+	snprintf(out, n, "%s/%s", dir, rest);
+	return 0;
+}
+
 int sys_open(const char *p, int m)
 {
 	char fn[512];
-	const char *b = strrchr(p, '\\');
 	int i;
 	(void)m;
-	snprintf(fn, sizeof fn, "%s/%s", packdir, b ? b + 1 : p);
+	if (map_path(p, fn, sizeof fn) < 0) return -1;
 	for (i = 0; i < 64; i++)
 		if (!files[i]) { files[i] = fopen(fn, "rb"); return files[i] ? i : -1; }
 	return -1;
@@ -50,6 +69,43 @@ int sys_close(int fd) { if (files[fd]) fclose(files[fd]); files[fd] = 0; return 
 int sys_closeall(void) { int i; for (i = 0; i < 64; i++) sys_close(i); return 0; }
 int sys_seek(int fd, int pos, int w) { (void)w; return fseek(files[fd], pos, SEEK_SET); }
 int sys_read(int fd, void *buf, int len) { return (int)fread(buf, 1, len, files[fd]); }
+
+/* sys_findfirst: 大文字小文字を区別するマスク照合(実機が区別するかは未確認なので、区別する前提で試す) */
+static DIR *fdir[8];
+static char fmask[8][64];
+int sys_findfirst(const char *mask, int *h, char *name, unsigned long *type)
+{
+	char dirpath[512], tmp[512];
+	const char *base = strrchr(mask, '\\');
+	int i;
+	size_t dn = base ? (size_t)(base - mask + 1) : 0;
+	char dm[64];
+	memcpy(dm, mask, dn); dm[dn] = 0;
+	snprintf(tmp, sizeof tmp, "%s%s", dm, "x");
+	if (map_path(tmp, dirpath, sizeof dirpath) < 0) return -1;
+	*strrchr(dirpath, '/') = 0;
+	for (i = 0; i < 8; i++) if (!fdir[i]) break;
+	if (i == 8) return -1;
+	fdir[i] = opendir(dirpath);
+	if (!fdir[i]) return -1;
+	strcpy(fmask[i], base ? base + 1 : mask);
+	*h = i;
+	return sys_findnext(i, name, type);
+}
+int sys_findnext(int h, char *name, unsigned long *type)
+{
+	struct dirent *e;
+	while ((e = readdir(fdir[h]))) {
+		if (e->d_type == DT_DIR) continue;
+		if (fnmatch(fmask[h], e->d_name, 0) == 0) {
+			strcpy(name, e->d_name);
+			*type = 1;
+			return 0;
+		}
+	}
+	return -1;
+}
+int sys_findclose(int h) { if (fdir[h]) closedir(fdir[h]); fdir[h] = 0; return 0; }
 
 /* ---- keys ---- */
 static const struct { const char *n; int code; } NAMES[] = {
@@ -96,6 +152,8 @@ int main(int argc, char **argv)
 	static char buf[4096];
 	packdir = argv[1];
 	outdir = argv[2];
+	sddir = argc > 4 && strcmp(argv[4], "-") ? argv[4] : 0;
+	if (!strcmp(packdir, "-")) packdir = 0;
 	strncpy(buf, argv[3], sizeof buf - 1);
 	parse(buf);
 	return real_main();

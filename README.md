@@ -1,6 +1,6 @@
 # exword-wiki: EX-word DATAPLUS 6 用 オフライン Wikipedia
 
-PC で Wikipedia の記事を固めたパック(WIKI.*)を作り、電子辞書側のビューアアプリ(XWIKI)で読む。
+PC で Wikipedia の記事を固めた辞書(パック。<名前>.IDX / .Dnn / .Inn / .NFO)を作り、電子辞書側のビューアアプリ(XWIKI)で読む。
 通信機能は使わない。画像(各記事の先頭画像)も表示できる。
 
 重要: ビューアは **実機でまだ一度も動かしていない**。ここまでの確認は次の3点。
@@ -13,7 +13,7 @@ PC で Wikipedia の記事を固めたパック(WIKI.*)を作り、電子辞書�
     wikipack.py     PC 側ツール(zim / fetch / build / font / demo / lookup / show / verify)
     src/            ビューア(main.c=画面と操作, core.c=パック読み出し・ローマ字・折り返し)
     prebuilt/       ビルド済みアプリ(ja/XWIKI, cn/XWIKI)
-    demo-pack/      デモ用データ一式(WIKI.IDX / D00 / I00 / FNT)。文章は自作で Wikipedia の本文ではない
+    demo-pack/      デモ用データ一式(辞書2つ: WIKI と TEST、日本語フォント WIKI.FNT)。文章は自作で Wikipedia の本文ではない
     test/           PC シミュレータ(sh test/run_sim.sh demo-pack "ne,ENTER")
     FORMAT.md       パック形式の仕様
 
@@ -43,13 +43,15 @@ PC で Wikipedia の記事を固めたパック(WIKI.*)を作り、電子辞書�
 
     python3 wikipack.py fetch titles.txt cache --lead-only \
       --user-agent "exword-wiki/0.1 (連絡先メール)"
-    python3 wikipack.py build cache out --encoding cp932
+    python3 wikipack.py build cache out --encoding cp932 --name WIKI --title "自分用Wikipedia"
     cp WIKI.FNT out/
     python3 wikipack.py verify out
 
 - fetch の `--user-agent` は Wikimedia の規約上必須(連絡先を入れる)。
 - `--lead-only` は導入部だけ。外すと全文(1記事ずつ取るので遅い)。
 - 画像は「フリーライセンスの先頭画像」だけ。`--no-images` で無し、`--gray` で軽量化。
+- `--name` は辞書のファイル名(英数字8文字まで。既定 WIKI)、`--title` は辞書の選択画面に出す名前(日本語可)。
+  複数の辞書を入れるときは辞書ごとに `--name` を変える(ファイル名が重ならないように)。
 - ビューアは文字コード cp932 専用。cp932 で表せない文字は ? になる。
 - fetch は私の環境から Wikipedia に接続できず、実際の API では未テスト(デモデータでは確認済み)。
   エラーが出たらメッセージをそのまま教えてほしい。
@@ -58,7 +60,7 @@ PC で Wikipedia の記事を固めたパック(WIKI.*)を作り、電子辞書�
 
     python3 wikipack.py demo cache && python3 wikipack.py build cache out && cp WIKI.FNT out/
 
-(demo-pack/ にはビルド済みのものが入っている)
+(demo-pack/ にはビルド済みの辞書が2つ入っている。両方を送ると「辞書の選択」画面を試せる)
 
 ## 全記事を入れる(.zim から)
 
@@ -101,18 +103,43 @@ devkitSH4 を入れて `make`(または GitHub Actions)。出力は build/ja/XWI
 
     mkdir -p ~/.local/share/exword/ja && cp -r prebuilt/ja/XWIKI ~/.local/share/exword/ja/
 
-電子辞書を「ライブラリー」→「通信」で接続待ち受けにして PC につなぎ、libexword で:
+電子辞書を「ライブラリー」→「通信」で接続待ち受けにして PC につなぎ(SD カードを使うなら、差した状態で)、libexword で:
 
     connect
     dict reset <名前>        # 追加コンテンツが全部消える。初回だけ。表示された key を控える
     dict auth <名前> <key>
     dict install XWIKI
-    send WIKI.FNT
+    send WIKI.FNT            # 日本語フォント。1つあればよい(どの保存場所でも可)
     send WIKI.IDX
+    send WIKI.NFO            # 辞書の表示名(無くても動く)
     send WIKI.D00            # D01, D02... があれば全部
     send WIKI.I00            # I01... があれば全部
 
-SD カードに入れるなら `setpath crd0://` を先に実行する(接続のたびに本体に戻る)。
+### 保存場所(内蔵メモリ / SD カード)を選ぶ
+
+libexword の `setpath` で送り先の保存場所を切り替える(ソースで確認した書式):
+
+    setpath mem:///          # 内蔵メモリのルート
+    setpath sd:///           # SD カードのルート
+    capacity                 # 今の保存場所の容量を表示
+    list                     # 今の保存場所のファイル一覧
+
+- 送り先を `setpath` で決めてから `send` する。辞書データは内蔵・SD のどちらに置いてもよい。
+- `dict install`(アプリ本体)も、今いる保存場所に対して働く。アプリは内蔵に入れたまま、データだけ SD に置く使い方でよい。
+- ビューアは起動時に内蔵と SD の両方から `*.IDX` を探して一覧にする。同じ名前の辞書が両方にあれば別々に並ぶ。
+
+## 辞書が複数あるとき(選択画面)
+
+- 見つかった辞書が1つなら、そのまま検索画面が開く。
+- 2つ以上なら「辞書の選択」画面が出る。`[内蔵]` / `[SD]` の印と表示名、ファイル名が並ぶ。
+  ↑↓で選び、Enter で開く。Back で終了。
+- 検索画面で Back を押すと、この選択画面に戻る(辞書が2つ以上あるとき)。
+- 表示名は `<名前>.NFO`(1行目)。無ければファイル名がそのまま出る。
+  送信済みの辞書に後から名前を付けるだけなら、辞書を作り直さず NFO だけ作って送る:
+
+      python3 wikipack.py nfo . --name WIKI --title "日本語Wikipedia"
+      (電子辞書で setpath を送り先にして)  send WIKI.NFO
+- 日本語フォント(`*.FNT`)は、最初に見つかったものを全辞書で共用する。
 
 ## 3. 使い方
 
@@ -135,15 +162,15 @@ SD カードに入れるなら `setpath crd0://` を先に実行する(接続の
 アプリは起動に失敗すると、英数字だけで原因を表示する(日本語フォントが読めない状況でも読めるように)。
 画面に出る項目と見方:
 
-    step:        どこで失敗したか(load WIKI.FNT / open WIKI.IDX / alloc ...)
+    step:        どこで失敗したか(no *.FNT font file / no *.IDX dictionary found / alloc ...)
     drv / id:    起動したドライブ(0=本体, 1=SD)とアプリID
-    font_read:   WIKI.FNT から読めたバイト数(-1 = 開けていない)。必要量は font_need(256784 など)
+    font_read:   フォント(*.FNT)から読めたバイト数(-1 = 開けていない)。必要量は font_need(256784 など)
     open attempts:  開こうとしたパスと sys_open の戻り値(-1 は失敗)。どのパスも -1 なら送信先が違う
 
 この表示を写真か書き写しで教えてもらえれば、置き場所やファイル名の扱いを合わせられる。
 (大文字のファイル名で開けなければ小文字名も自動で試す。読み込みは 16KB ずつに分けている)
 
-起動すると最初に "EXWIKI build 4" と、1〜4 の進行表示が出る。これが出なければ古いビルドが動いている
+起動すると最初に "EXWIKI build 5" と、1〜4 の進行表示(4 は見つかった辞書の数)が出る。これが出なければ古いビルドが動いている
 (アプリを入れ直す: `dict remove XWIKI` のあと `dict install XWIKI`)。
 途中で止まった場合は、最後に表示された番号を教えてほしい。
 記事を開くときは画面下に "loading..." が出る。これが出たまま動かなければ、記事の展開か画像の表示で止まっている。
@@ -151,11 +178,12 @@ SD カードに入れるなら `setpath crd0://` を先に実行する(接続の
 ## 4. 実機で確かめてほしい点(未確認)
 
 1. send のファイル名と置き場所: Gnuboy EX の説明では send したファイルはドライブのルートに置かれる。
-   ビューアはルート → `<APPID>\_USER\` → `<APPID>\` の順に WIKI.IDX を探す。
-   起動時に「WIKI.IDX を読めません」と出たら、ここを疑う。
+   ビューアは内蔵・SD それぞれの、ルート / `<APPID>\_USER\` / `<APPID>\` から `*.IDX` を探す。
+   起動時に「no *.IDX dictionary found」と出たら、ここを疑う(画面に探した場所と見つかった数が出る)。
+   SD は `\\crd0\`、内蔵は `\\drv0\` という名前で探しているが、SD 側の名前は実機で未確認。
 2. send が WIKI.D00 のような拡張子・複数ファイル・数MBの大きさを受け付けるか。
    (Gnuboy の ROM は拡張子 .gbc に変える必要があった、という記述がある)
-3. 内蔵メモリの空き容量。足りなければ SD(`setpath crd0://`)。
+3. 内蔵メモリの空き容量(`capacity` で確認できる)。足りなければ SD(`setpath sd:///`)。
 4. キー配置: SHIFT / 記号 / F1 / PageUp・Down の反応。
 5. 大きなパックでの検索・表示の速さ(検索は二分探索で、1回あたり十数回のファイル読み込み)。
 6. 画面描画の速さ(1画面ぶんの再描画に数百ms かかる可能性)。

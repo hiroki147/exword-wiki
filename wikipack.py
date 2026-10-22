@@ -4,8 +4,9 @@
 サブコマンド:
   demo    ネット不要のデモ用キャッシュを作る(ビューア開発・動作確認用)
   fetch   Wikipedia API から記事・リンク・サムネイルをキャッシュに保存
-  build   キャッシュから WIKI.IDX / WIKI.Dxx / WIKI.Ixx を生成
+  build   キャッシュから <名前>.IDX / .Dxx / .Ixx を生成(名前は --name、既定 WIKI)
   zim     Kiwix の .zim から直接パックを生成(全記事向け。画像なし)
+  nfo     辞書の表示名(.NFO)だけを作る(辞書本体を作り直さなくてよい)
   font    TTF から日本語ビットマップフォント WIKI.FNT を生成(ビューア必須)
   lookup  (参照実装) かな前方一致で検索
   show    (参照実装) 記事を表示し、画像を書き出す
@@ -397,9 +398,25 @@ def make_jpeg(path, w, h, quality, gray):
     return buf.getvalue(), im.size
 
 
+def pack_name(s):
+    """辞書のファイル名(拡張子なし)。8文字までの英数字。大文字にそろえる。"""
+    n = s.upper()
+    if not re.fullmatch(r"[A-Z0-9_]{1,8}", n):
+        sys.exit("--name は英数字(と _)8文字までにしてください: " + s)
+    return n
+
+
+def write_nfo(out, name, title, enc):
+    """辞書の表示名(ビューアの選択画面に出る)。<名前>.NFO の1行目に Shift_JIS で書く。"""
+    t = prep_text(title or name, enc).replace("\r", " ").replace("\n", " ")
+    b = enc_trunc(t, "cp932" if enc == "cp932" else enc, 34)
+    with open(os.path.join(out, name + ".NFO"), "wb") as f:
+        f.write(b + b"\r\n")
+
+
 class Chunker:
-    def __init__(self, outdir, letter, limit):
-        self.outdir, self.letter, self.limit = outdir, letter, limit
+    def __init__(self, outdir, letter, limit, prefix="WIKI"):
+        self.outdir, self.letter, self.limit, self.prefix = outdir, letter, limit, prefix
         self.no, self.size, self.f, self.files = -1, 0, None, []
 
     def add(self, blob):
@@ -416,7 +433,7 @@ class Chunker:
         self.no += 1
         if self.no > 99:
             sys.exit("ファイルが100個を超えました。--chunk-mb を大きくするか記事数を減らしてください")
-        name = "WIKI.%s%02d" % (self.letter, self.no)
+        name = "%s.%s%02d" % (self.prefix, self.letter, self.no)
         self.f = open(os.path.join(self.outdir, name), "wb")
         self.files.append(name)
         self.size = 0
@@ -453,8 +470,9 @@ def cmd_build(a):
     title_to_id = {r["title"]: i for i, r in enumerate(recs)}
 
     os.makedirs(a.out, exist_ok=True)
-    dch = Chunker(a.out, "D", int(a.chunk_mb * 1024 * 1024))
-    ich = Chunker(a.out, "I", int(a.chunk_mb * 1024 * 1024))
+    name = pack_name(a.name)
+    dch = Chunker(a.out, "D", int(a.chunk_mb * 1024 * 1024), name)
+    ich = Chunker(a.out, "I", int(a.chunk_mb * 1024 * 1024), name)
     table, n_links, n_imgs, raw_total, comp_total, img_total = [], 0, 0, 0, 0, 0
     bad_chars = {}
     for i, r in enumerate(recs):
@@ -491,7 +509,8 @@ def cmd_build(a):
     dch.close()
     ich.close()
 
-    with open(os.path.join(a.out, "WIKI.IDX"), "wb") as f:
+    write_nfo(a.out, name, a.title, enc)
+    with open(os.path.join(a.out, name + ".IDX"), "wb") as f:
         f.write(HEADER.pack(MAGIC, VERSION, ENC_IDS[enc], 0, len(recs), len(recs),
                             len(dch.files), len(ich.files), KEY_SIZE, TITLE_SIZE))
         for i, r in enumerate(recs):
@@ -680,11 +699,11 @@ def _z_work(span):
 class PackWriter:
     """記事IDを先に決めておき、完成した順に書き込む(IDX は最後にまとめて書く)。"""
 
-    def __init__(self, out, n, enc, chunk_bytes):
+    def __init__(self, out, n, enc, chunk_bytes, name="WIKI"):
         os.makedirs(out, exist_ok=True)
-        self.out, self.n, self.enc = out, n, enc
-        self.d = Chunker(out, "D", chunk_bytes)
-        self.i = Chunker(out, "I", chunk_bytes)
+        self.out, self.n, self.enc, self.name = out, n, enc, name
+        self.d = Chunker(out, "D", chunk_bytes, name)
+        self.i = Chunker(out, "I", chunk_bytes, name)
         self.rec = ARTICLE.size + TITLE_SIZE
         self.table = bytearray(n * self.rec)
         self.keys = []
@@ -702,7 +721,7 @@ class PackWriter:
         self.d.close()
         self.i.close()
         self.keys.sort()
-        with open(os.path.join(self.out, "WIKI.IDX"), "wb") as f:
+        with open(os.path.join(self.out, self.name + ".IDX"), "wb") as f:
             f.write(HEADER.pack(MAGIC, VERSION, ENC_IDS[self.enc], 0, self.n, len(self.keys),
                                 len(self.d.files), len(self.i.files), KEY_SIZE, TITLE_SIZE))
             for key, aid in self.keys:
@@ -761,7 +780,8 @@ def cmd_zim(a):
          "drop": set(a.drop_sections.split(",")) if a.drop_sections else set(),
          "kakasi": not a.no_kakasi}
     _ZG["g"] = g
-    pw = PackWriter(a.out, len(arts), a.encoding, int(a.chunk_mb * 1024 * 1024))
+    name = pack_name(a.name)
+    pw = PackWriter(a.out, len(arts), a.encoding, int(a.chunk_mb * 1024 * 1024), name)
     span = 100
     spans = [(i, min(i + span, len(arts))) for i in range(0, len(arts), span)]
     stat, errs, done, raw_total, comp_total = {}, 0, 0, 0, 0
@@ -802,6 +822,7 @@ def cmd_zim(a):
         for sp in spans:
             consume(_z_work(sp))
     pw.finish()
+    write_nfo(a.out, name, a.title, a.encoding)
     print("完了: 記事 %d 件 / 本文 %s -> %s (圧縮) / ファイル D:%d 個" %
           (len(arts), human(raw_total), human(comp_total), len(pw.d.files)))
     print("読みの由来: " + ", ".join("%s=%d" % kv for kv in sorted(stat.items())))
@@ -809,16 +830,22 @@ def cmd_zim(a):
         print("  ! 変換に失敗した記事 %d 件(最初の5件を表示済み)" % errs)
     if stat.get("none"):
         print("  ! 読みが取れなかった記事があります。pip install pykakasi を入れるか、--no-kakasi を外してください。")
-    print("出力: %s   次は WIKI.FNT を同じ場所に置いて verify" % a.out)
+    print("出力: %s (%s.*)   次は日本語フォント(*.FNT)を電子辞書に入れて verify" % (a.out, name))
 
 
 # ------------------------------------------------------------- reference ---
 class Pack:
     """C 側ビューアが実装すべき読み出し手順の参照実装(seek+read のみ)。"""
 
-    def __init__(self, d):
+    def __init__(self, d, name=None):
         self.d = d
-        self.idx = open(os.path.join(d, "WIKI.IDX"), "rb")
+        if name is None:  # フォルダ内の *.IDX が1つならそれを使う
+            c = [f for f in os.listdir(d) if f.upper().endswith(".IDX")]
+            if len(c) != 1:
+                sys.exit("--name を指定してください(見つかった辞書: %s)" % (", ".join(sorted(c)) or "なし"))
+            name = c[0][:-4]
+        self.pname = name
+        self.idx = open(os.path.join(d, name + ".IDX"), "rb")
         h = HEADER.unpack(self.idx.read(HEADER.size))
         (magic, ver, enc, _fl, self.n_art, self.n_key,
          self.n_d, self.n_i, self.key_size, self.title_size) = h
@@ -862,7 +889,7 @@ class Pack:
 
     def body(self, aid):
         r = self.rec(aid)
-        with open(os.path.join(self.d, "WIKI.D%02d" % r["dno"]), "rb") as f:
+        with open(os.path.join(self.d, "%s.D%02d" % (self.pname, r["dno"])), "rb") as f:
             f.seek(r["off"])
             comp = f.read(r["clen"])
         raw = zlib.decompress(comp, -15)
@@ -873,7 +900,7 @@ class Pack:
         r = self.rec(aid)
         if not r["ilen"]:
             return None
-        with open(os.path.join(self.d, "WIKI.I%02d" % r["ino"]), "rb") as f:
+        with open(os.path.join(self.d, "%s.I%02d" % (self.pname, r["ino"])), "rb") as f:
             f.seek(r["ioff"])
             return f.read(r["ilen"])
 
@@ -892,7 +919,7 @@ def render(text):
 
 
 def cmd_lookup(a):
-    p = Pack(a.pack)
+    p = Pack(a.pack, a.name)
     ids = p.prefix(a.query, a.limit)
     if not ids:
         print("(該当なし)")
@@ -902,7 +929,7 @@ def cmd_lookup(a):
 
 
 def cmd_show(a):
-    p = Pack(a.pack)
+    p = Pack(a.pack, a.name)
     r = p.rec(a.id)
     print("=== %s (#%d) ===" % (r["title"], a.id))
     print(render(p.body(a.id)))
@@ -914,7 +941,7 @@ def cmd_show(a):
 
 
 def cmd_verify(a):
-    p = Pack(a.pack)
+    p = Pack(a.pack, a.name)
     errs = 0
     prev = b""
     for i in range(p.n_key):
@@ -953,6 +980,15 @@ def cmd_verify(a):
 
 # ------------------------------------------------------------------ font ---
 FONT_HEADER = struct.Struct("<4sBBBBHH4x")   # 16 bytes: magic, fw, fh, hw, pad, rows, cells
+
+
+def cmd_nfo(a):
+    name = pack_name(a.name)
+    os.makedirs(a.out, exist_ok=True)
+    write_nfo(a.out, name, a.title, "cp932")
+    path = os.path.join(a.out, name + ".NFO")
+    print("作成:", path, "->", open(path, "rb").read().decode("cp932").strip())
+    print("電子辞書へ: setpath を送り先(mem:/// か sd:///)にして  send %s.NFO" % name)
 
 
 def cmd_font(a):
@@ -1070,11 +1106,19 @@ def main():
     s.add_argument("--drop-sections", default=",".join(DEFAULT_DROP))
     s.add_argument("--chunk-mb", type=float, default=4.0, help="1ファイルの目安サイズ")
     s.add_argument("--no-images", action="store_true")
+    s.add_argument("--name", default="WIKI", help="辞書のファイル名(8文字までの英数字)。複数の辞書を入れ分けるとき変える")
+    s.add_argument("--title", help="選択画面に出す辞書の名前(日本語可)")
     s.add_argument("--img-w", type=int, default=240)
     s.add_argument("--img-h", type=int, default=160)
     s.add_argument("--img-quality", type=int, default=60)
     s.add_argument("--gray", action="store_true", help="画像をグレースケールにして軽くする")
     s.set_defaults(f=cmd_build)
+
+    s = sp.add_parser("nfo")
+    s.add_argument("out", help="出力先フォルダ(例: . )")
+    s.add_argument("--name", default="WIKI", help="辞書のファイル名(送信済みの NAME.IDX の NAME と同じにする)")
+    s.add_argument("--title", required=True, help="選択画面に出す名前(日本語可)")
+    s.set_defaults(f=cmd_nfo)
 
     s = sp.add_parser("font")
     s.add_argument("out", help="出力ファイル(WIKI.FNT)")
@@ -1098,22 +1142,27 @@ def main():
     s.add_argument("--jobs", type=int, default=1, help="並列数(CPUコア数くらい)")
     s.add_argument("--limit", type=int, default=0, help="先頭から N 記事だけ(試運転・容量見積もり用)")
     s.add_argument("--no-kakasi", action="store_true", help="pykakasi による読みの推定をしない(速い)")
+    s.add_argument("--name", default="WIKI", help="辞書のファイル名(8文字までの英数字)。複数の辞書を入れ分けるとき変える")
+    s.add_argument("--title", help="選択画面に出す辞書の名前(日本語可)")
     s.set_defaults(f=cmd_zim)
 
     s = sp.add_parser("lookup")
     s.add_argument("pack")
+    s.add_argument("--name", help="辞書のファイル名(フォルダに *.IDX が1つだけなら省略可)")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(f=cmd_lookup)
 
     s = sp.add_parser("show")
     s.add_argument("pack")
+    s.add_argument("--name", help="辞書のファイル名(フォルダに *.IDX が1つだけなら省略可)")
     s.add_argument("id", type=int)
     s.add_argument("--save-image", metavar="FILE.jpg")
     s.set_defaults(f=cmd_show)
 
     s = sp.add_parser("verify")
     s.add_argument("pack")
+    s.add_argument("--name", help="辞書のファイル名(フォルダに *.IDX が1つだけなら省略可)")
     s.add_argument("--sample", type=int, default=20000, help="本文を全文チェックする記事数の上限(無作為)")
     s.set_defaults(f=cmd_verify)
 
